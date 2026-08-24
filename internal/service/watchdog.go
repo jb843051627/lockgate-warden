@@ -11,7 +11,7 @@ import (
 func (s *Service) RunWatchdog() {
 	now := s.clock.Now()
 
-	closed, err := s.store.AutoCloseStaleWarnings(now.Add(s.params.WarnTTL), now)
+	closed, err := s.store.AutoCloseStaleWarnings(now.Add(-s.params.WarnTTL), now)
 	if err != nil {
 		log.Printf("watchdog auto-close failed: %v", err)
 	} else if closed > 0 {

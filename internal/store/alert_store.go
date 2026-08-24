@@ -106,9 +106,10 @@ func (s *Store) CloseAlert(id int64, note string, at time.Time) error {
 }
 
 // AutoCloseStaleWarnings 批量关闭超时的 open warning 告警，返回关闭数量。
+// cutoff 为过期阈值：latest_seen_at 早于 cutoff（即最后一次命中距今已超 WarnTTL）才关闭。
 func (s *Store) AutoCloseStaleWarnings(cutoff time.Time, at time.Time) (int64, error) {
 	res, err := s.db.Exec(`UPDATE alerts SET status='closed', close_note='auto: stale warning', closed_at=?, updated_at=?
-		WHERE status='open' AND severity='warning' AND latest_seen_at>?`,
+		WHERE status='open' AND severity='warning' AND latest_seen_at<?`,
 		formatTime(at), formatTime(at), formatTime(cutoff))
 	if err != nil {
 		return 0, err
