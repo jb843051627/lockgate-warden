@@ -1,0 +1,266 @@
+package service
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/jb843051627/lockgate-warden/internal/engine"
+	"github.com/jb843051627/lockgate-warden/internal/metrics"
+	"github.com/jb843051627/lockgate-warden/internal/model"
+	"github.com/jb843051627/lockgate-warden/internal/validation"
+)
+
+func (s *Service) reject() {
+	if s.metrics != nil {
+		s.metrics.Inc(metrics.BatchesRejected)
+	}
+}
+
+func (s *Service) countAccepted(inserted, dupes int64) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.Inc(metrics.BatchesAccepted)
+	s.metrics.Add(metrics.PointsInserted, inserted)
+	s.metrics.Add(metrics.PointsDuplicate, dupes)
+}
+
+// tallyToMap 三级计数转响应映射。
+func tallyToMap(t validation.QualityTally) map[model.Quality]int64 {
+	return map[model.Quality]int64{
+		model.QualityGood:     t.Good,
+		model.QualitySuspect:  t.Suspect,
+		model.QualityRejected: t.Rejected,
+	}
+}
+
+// raiseAlert 告警去重窗口内的同键告警只累加次数不新建记录。
+// 返回 true 表示新建了告警。
+func (s *Service) raiseAlert(chamberID, sensorID int64, kind string, severity model.AlertSeverity, message string) (bool, error) {
+	dedupKey := fmt.Sprintf("C%d|%s", chamberID, kind)
+	if sensorID > 0 {
+		dedupKey = fmt.Sprintf("%s|S%d", dedupKey, sensorID)
+	}
+	now := s.clock.Now()
+	candidate, err := s.store.FindDedupCandidate(dedupKey, now.Add(-s.params.DedupWindow))
+	switch {
+	case err == nil:
+		return false, s.store.TouchAlert(candidate.ID, 1, now)
+	case !errors.Is(err, model.ErrNotFound):
+		return false, err
+	}
+	alert := &model.Alert{
+		ChamberID:    chamberID,
+		SensorID:     sensorID,
+		DedupKey:     dedupKey,
+		Kind:         kind,
+		Severity:     severity,
+		Message:      message,
+		Status:       model.AlertOpen,
+		FirstSeenAt:  now,
+		LatestSeenAt: now,
+	}
+	if err := s.store.InsertAlert(alert); err != nil {
+		return false, err
+	}
+	if s.metrics != nil {
+		s.metrics.Inc(metrics.AlertsRaised)
+	}
+	log.Printf("alert raised chamber=%d kind=%s severity=%s", chamberID, kind, severity)
+	return true, nil
+}
+
+// ListAlerts 列出告警；status 为空返回全部。
+func (s *Service) ListAlerts(status string, limit int) ([]model.Alert, error) {
+	if status != "" {
+		if _, err := parseStatusFilter(status); err != nil {
+			return nil, err
+		}
+	}
+	return s.store.ListAlerts(status, limit)
+}
+
+func parseStatusFilter(raw string) (model.AlertStatus, error) {
+	switch model.AlertStatus(raw) {
+	case model.AlertOpen, model.AlertAcked, model.AlertClosed:
+		return model.AlertStatus(raw), nil
+	default:
+		return "", fmt.Errorf("unknown alert status filter %q", raw)
+	}
+}
+
+// AckAlert open → acked。重复 ack 视为冲突。
+func (s *Service) AckAlert(id int64, by string) (model.Alert, error) {
+	alert, err := s.store.GetAlert(id)
+	if err != nil {
+		return alert, err
+	}
+	if alert.Status != model.AlertOpen {
+		return alert, fmt.Errorf("%w: alert %d is %s, expected open", model.ErrConflict, id, alert.Status)
+	}
+	if err := s.store.AckAlert(id, by, s.clock.Now()); err != nil {
+		return alert, err
+	}
+	return s.store.GetAlert(id)
+}
+
+// CloseAlert 关闭告警：critical 必须先 ack；非 critical 允许直接关闭。
+func (s *Service) CloseAlert(id int64, note string) (model.Alert, error) {
+	alert, err := s.store.GetAlert(id)
+	if err != nil {
+		return alert, err
+	}
+	if alert.Status == model.AlertClosed {
+		return alert, fmt.Errorf("%w: alert %d already closed", model.ErrConflict, id)
+	}
+	if alert.Severity == model.SeverityCritical && alert.Status != model.AlertAcked {
+		return alert, fmt.Errorf("%w: alert %d", model.ErrAckRequired, id)
+	}
+	if err := s.store.CloseAlert(id, note, s.clock.Now()); err != nil {
+		return alert, err
+	}
+	if s.metrics != nil {
+		s.metrics.Inc(metrics.AlertsClosed)
+	}
+	return s.store.GetAlert(id)
+}
+
+// evaluateThresholds 遍历闸室全部启用传感器做阈值越限判定。
+// 单个传感器失败不中断整批入库链，只记日志。
+func (s *Service) evaluateThresholds(chamberID int64, now time.Time) ([]string, error) {
+	sensors, err := s.store.ListSensors(chamberID)
+	if err != nil {
+		return nil, err
+	}
+	var fresh []string
+	for _, sen := range sensors {
+		if !sen.Enabled {
+			continue
+		}
+		kind, err := s.checkSensorThreshold(sen, now)
+		if err != nil {
+			log.Printf("threshold check deferred sensor=%s: %v", sen.Code, err)
+			continue
+		}
+		if kind != "" {
+			fresh = append(fresh, kind)
+		}
+	}
+	return fresh, nil
+}
+
+// checkSensorThreshold 按传感器种类分发到对应判据；返回新建告警的键（无则空）。
+func (s *Service) checkSensorThreshold(sen model.GateSensor, now time.Time) (string, error) {
+	hb, err := s.store.LatestHeartbeat(sen.ID)
+	if err != nil {
+		return "", err
+	}
+	switch sen.Kind {
+	case model.KindWind:
+		return s.checkWind(sen, hb.Value, now)
+	case model.KindLevel:
+		return s.checkHead(sen, hb.Value, now)
+	case model.KindPos:
+		return s.checkMisalign(sen, hb.Value, now)
+	default:
+		return "", nil // flow 只参与质量统计，无独立阈值
+	}
+}
+
+func (s *Service) checkWind(sen model.GateSensor, speed float64, now time.Time) (string, error) {
+	verdict := engine.EvaluateWindLimit(speed, engine.DefaultWindThresholds())
+	switch {
+	case verdict.Critical:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "wind_critical", model.SeverityCritical, verdict.Detail)
+		if created {
+			return "wind_critical", err
+		}
+		return "", err
+	case verdict.Restricted:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "wind_restricted", model.SeverityWarning, verdict.Detail)
+		if created {
+			return "wind_restricted", err
+		}
+		return "", err
+	default:
+		return "", nil
+	}
+}
+
+// headDetail 把水位差偏移结论格式化为告警文本。
+func headDetail(o engine.HeadOffset) string {
+	return engine.HeadDetail(o)
+}
+
+func (s *Service) checkHead(sen model.GateSensor, measuredM float64, now time.Time) (string, error) {
+	expected, tolerance, err := s.baselineFor(sen, now)
+	if err != nil {
+		return "", err
+	}
+	offset, err := engine.EvaluateHead(measuredM, expected, tolerance)
+	if err != nil {
+		return "", err
+	}
+	detail := headDetail(offset)
+	switch offset.Level {
+	case engine.HeadCritical:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "head_offset", model.SeverityCritical, detail)
+		if created {
+			return "head_offset", err
+		}
+		return "", err
+	case engine.HeadSuspect:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "head_drift", model.SeverityWarning, detail)
+		if created {
+			return "head_drift", err
+		}
+		return "", err
+	default:
+		return "", nil
+	}
+}
+
+func (s *Service) checkMisalign(sen model.GateSensor, angleDeg float64, now time.Time) (string, error) {
+	if sen.GateRefID <= 0 {
+		return "", errors.New("position sensor not bound to a gate")
+	}
+	gate, err := s.store.GetGate(sen.GateRefID)
+	if err != nil {
+		return "", err
+	}
+	limit := s.activeFrost(now).MisalignLimit(gate.MisalignLimitDeg)
+	verdict, err := engine.EvaluateMisalignment(gate.ID, gate.Code, angleDeg, limit)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case verdict.Critical:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "misalign_exceed", model.SeverityCritical, verdict.Detail)
+		if created {
+			return "misalign_exceed", err
+		}
+		return "", err
+	case verdict.Watch:
+		created, err := s.raiseAlert(sen.ChamberID, sen.ID, "misalign_watch", model.SeverityWarning, verdict.Detail)
+		if created {
+			return "misalign_watch", err
+		}
+		return "", err
+	default:
+		return "", nil
+	}
+}
+
+// baselineFor 取传感器生效基线：优先水位基线表（含温度补偿），回落档案容差。
+func (s *Service) baselineFor(sen model.GateSensor, now time.Time) (expected, tolerance float64, err error) {
+	baseline, bErr := s.store.ActiveBaselineForSensor(sen.ChamberID, sen.Code, now)
+	if bErr == nil {
+		return baseline.EffectiveExpected(), baseline.ToleranceM, nil
+	}
+	if !errors.Is(bErr, model.ErrNotFound) {
+		return 0, 0, bErr
+	}
+	return sen.ExpectedValue, sen.Tolerance, nil
+}
