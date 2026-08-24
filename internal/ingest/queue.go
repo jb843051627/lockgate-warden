@@ -19,11 +19,12 @@ type Task struct {
 
 // Pipeline 单工作协程的任务管道。
 type Pipeline struct {
-	tasks   chan Task
-	stop    chan struct{}
-	wg      sync.WaitGroup
-	metrics *metrics.Metrics
-	logger  *log.Logger
+	tasks     chan Task
+	stop      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	metrics   *metrics.Metrics
+	logger    *log.Logger
 }
 
 // New 启动 worker 协程并返回管道。
@@ -86,6 +87,8 @@ func (p *Pipeline) Submit(task Task) bool {
 
 // Close 停止 worker 并等待退出；幂等可安全多次调用。
 func (p *Pipeline) Close() {
-	close(p.stop)
+	p.closeOnce.Do(func() {
+		close(p.stop)
+	})
 	p.wg.Wait()
 }
