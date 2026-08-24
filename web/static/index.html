@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>lockgate-warden 船闸监控</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header><h1>lockgate-warden</h1><span id="clock"></span></header>
+<main>
+  <section class="card">
+    <h2>闸室状态</h2>
+    <table id="chambers"><thead><tr><th>编号</th><th>名称</th><th>状态</th><th>最大水位差</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section class="card">
+    <h2>未关闭告警</h2>
+    <table id="alerts"><thead><tr><th>级别</th><th>类型</th><th>状态</th><th>次数</th><th>消息</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section class="card">
+    <h2>周报 KPI</h2>
+    <form id="kpi-form">
+      <label>chamber_id <input name="chamber_id" value="1"></label>
+      <label>days <input name="days" value="7"></label>
+      <button type="submit">查询</button>
+    </form>
+    <pre id="kpi-out">—</pre>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
