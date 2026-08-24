@@ -26,9 +26,11 @@ const (
 )
 
 // Metrics 全部指标集中在一个结构里，按名字寻址。
+// samples 用 sync.Map 承载，使 ad-hoc 计数器的声明路径在并发下
+// 既能 LoadOrStore 去重（不会因重复创建 sample 而丢计数），
+// 又避免对普通 map 的并发读写触发 fatal error: concurrent map writes。
 type Metrics struct {
-	mu      sync.Mutex
-	samples map[string]*sample
+	samples sync.Map // map[string]*sample
 }
 
 type sample struct {
@@ -40,7 +42,7 @@ type sample struct {
 
 // New 构造并注册预定义指标。
 func New() *Metrics {
-	m := &Metrics{samples: make(map[string]*sample)}
+	m := &Metrics{}
 	m.declare(BatchesAccepted, "telemetry batches accepted")
 	m.declare(BatchesRejected, "telemetry batches rejected")
 	m.declare(PointsInserted, "telemetry points inserted")
@@ -57,11 +59,23 @@ func New() *Metrics {
 }
 
 func (m *Metrics) declare(name, help string) {
-	m.samples[name] = &sample{help: help}
+	m.samples.Store(name, &sample{help: help})
 }
 
 func (m *Metrics) declareGauge(name, help string) {
-	m.samples[name] = &sample{help: help, isGauge: true}
+	m.samples.Store(name, &sample{help: help, isGauge: true})
+}
+
+// load 返回指定名字的 sample，缺失时按 factory 现场声明。
+// 用 LoadOrStore 保证并发下同一名字只会落到同一个 sample，
+// 随后所有累加都走无锁原子路径，既不丢计数也不竞争全局锁。
+func (m *Metrics) load(name string, factory func() *sample) *sample {
+	if v, ok := m.samples.Load(name); ok {
+		return v.(*sample)
+	}
+	s := factory()
+	actual, _ := m.samples.LoadOrStore(name, s)
+	return actual.(*sample)
 }
 
 // Inc 计数器加一。
@@ -69,38 +83,32 @@ func (m *Metrics) Inc(name string) { m.Add(name, 1) }
 
 // Add 计数器累加。
 func (m *Metrics) Add(name string, delta int64) {
-	s, ok := m.samples[name]
-	if !ok {
-		s = &sample{help: "ad-hoc counter"}
-		m.samples[name] = s
-	}
+	s := m.load(name, func() *sample { return &sample{help: "ad-hoc counter"} })
 	s.counter.Add(delta)
 }
 
 // SetGauge 设置仪表绝对值（如队列深度）。
 func (m *Metrics) SetGauge(name string, value int64) {
-	s, ok := m.samples[name]
-	if !ok {
-		s = &sample{help: "ad-hoc gauge", isGauge: true}
-		m.samples[name] = s
-	}
+	s := m.load(name, func() *sample { return &sample{help: "ad-hoc gauge", isGauge: true} })
 	s.gauge.Store(value)
 }
 
 // Snapshot 返回排序后的名称→值映射，便于测试与导出。
 func (m *Metrics) Snapshot() map[string]int64 {
-	out := make(map[string]int64, len(m.samples))
-	names := make([]string, 0, len(m.samples))
-	for name := range m.samples {
-		names = append(names, name)
-	}
+	names := make([]string, 0, 16)
+	m.samples.Range(func(key, _ any) bool {
+		names = append(names, key.(string))
+		return true
+	})
 	sort.Strings(names)
+	out := make(map[string]int64, len(names))
 	for _, name := range names {
-		s := m.samples[name]
-		if s.isGauge {
-			out[name] = s.gauge.Load()
+		s, _ := m.samples.Load(name)
+		sm := s.(*sample)
+		if sm.isGauge {
+			out[name] = sm.gauge.Load()
 		} else {
-			out[name] = s.counter.Load()
+			out[name] = sm.counter.Load()
 		}
 	}
 	return out
@@ -108,20 +116,18 @@ func (m *Metrics) Snapshot() map[string]int64 {
 
 // Render 输出文本格式指标页（# HELP/# TYPE 行 + 样本行）。
 func (m *Metrics) Render() string {
-	m.mu.Lock()
-	names := make([]string, 0, len(m.samples))
 	type row struct {
 		name  string
 		help  string
 		gauge bool
 	}
-	rows := make([]row, 0, len(m.samples))
-	for name, s := range m.samples {
-		names = append(names, name)
-		rows = append(rows, row{name: name, help: s.help, gauge: s.isGauge})
-	}
-	m.mu.Unlock()
-	sort.Strings(names)
+	rows := make([]row, 0, 16)
+	m.samples.Range(func(key, value any) bool {
+		s := value.(*sample)
+		rows = append(rows, row{name: key.(string), help: s.help, gauge: s.isGauge})
+		return true
+	})
+	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
 
 	var b strings.Builder
 	for _, r := range rows {
@@ -132,15 +138,16 @@ func (m *Metrics) Render() string {
 		}
 		fmt.Fprintf(&b, "# TYPE %s %s\n", r.name, kind)
 	}
-	for _, name := range names {
-		s := m.samples[name]
+	for _, r := range rows {
+		s, _ := m.samples.Load(r.name)
+		sm := s.(*sample)
 		var v int64
-		if s.isGauge {
-			v = s.gauge.Load()
+		if sm.isGauge {
+			v = sm.gauge.Load()
 		} else {
-			v = s.counter.Load()
+			v = sm.counter.Load()
 		}
-		fmt.Fprintf(&b, "%s %d\n", name, v)
+		fmt.Fprintf(&b, "%s %d\n", r.name, v)
 	}
 	return b.String()
 }
