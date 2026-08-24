@@ -31,7 +31,8 @@ func (c *Cache) SensorSnapshotByID(id int64) (*SensorSnapshot, bool) {
 	if !ok {
 		return nil, false
 	}
-	return snap, true
+	cp := *snap // 返回副本，隔离调用方对快照的本地修改，避免污染热缓存
+	return &cp, true
 }
 
 // chamberKey 闸室状态缓存键。
