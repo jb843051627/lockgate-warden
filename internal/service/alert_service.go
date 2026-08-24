@@ -107,10 +107,17 @@ func (s *Service) AckAlert(id int64, by string) (model.Alert, error) {
 }
 
 // CloseAlert 关闭告警：critical 必须先 ack；非 critical 允许直接关闭。
+// 已 closed 的告警拒绝重复关闭（避免覆盖 close_note）。
 func (s *Service) CloseAlert(id int64, note string) (model.Alert, error) {
 	alert, err := s.store.GetAlert(id)
 	if err != nil {
 		return alert, err
+	}
+	if alert.Status == model.AlertClosed {
+		return alert, fmt.Errorf("%w: alert %d is already closed", model.ErrConflict, id)
+	}
+	if alert.Severity == model.SeverityCritical && alert.Status != model.AlertAcked {
+		return alert, fmt.Errorf("%w: critical alert %d must be acknowledged before close", model.ErrAckRequired, id)
 	}
 	if err := s.store.CloseAlert(id, note, s.clock.Now()); err != nil {
 		return alert, err

@@ -95,10 +95,11 @@ func (s *Store) AckAlert(id int64, by string, at time.Time) error {
 	return requireAffected(res, model.ErrConflict)
 }
 
-// CloseAlert 关闭告警；非 critical 允许 open → closed（由 service 校验级别）。
+// CloseAlert 关闭告警；仅允许 open/acked → closed，已 closed 返回冲突。
+// 非 critical 允许 open → closed、critical 需先 ack（由 service 校验级别）。
 func (s *Store) CloseAlert(id int64, note string, at time.Time) error {
 	res, err := s.db.Exec(`UPDATE alerts SET status='closed', close_note=?, closed_at=?, updated_at=?
-		WHERE id=?`, note, formatTime(at), formatTime(at), id)
+		WHERE id=? AND status IN ('open','acked')`, note, formatTime(at), formatTime(at), id)
 	if err != nil {
 		return err
 	}
