@@ -8,11 +8,12 @@ import (
 )
 
 // FindDedupCandidate 在去重窗口内查找同键活跃告警（open/acked）。
+// 已 closed 或超出窗口的旧记录不参与去重，强制新建告警。
 func (s *Store) FindDedupCandidate(dedupKey string, windowStart time.Time) (model.Alert, error) {
 	row := s.db.QueryRow(`SELECT id,chamber_id,sensor_id,dedup_key,kind,severity,message,status,occurrences,
 		first_seen_at,latest_seen_at,acked_by,acked_at,closed_at,close_note,updated_at
-		FROM alerts WHERE dedup_key=?
-		ORDER BY id DESC LIMIT 1`, dedupKey)
+		FROM alerts WHERE dedup_key=? AND status IN ('open','acked') AND latest_seen_at>=?
+		ORDER BY id DESC LIMIT 1`, dedupKey, formatTime(windowStart))
 	return scanAlert(row.Scan)
 }
 
