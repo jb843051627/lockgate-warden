@@ -1,0 +1,15 @@
+body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+header { display: flex; align-items: baseline; gap: 16px; padding: 12px 24px; background: #1e293b; }
+header h1 { font-size: 18px; margin: 0; color: #38bdf8; }
+main { display: grid; gap: 16px; padding: 16px 24px; }
+.card { background: #1e293b; border-radius: 10px; padding: 14px 18px; }
+.card h2 { font-size: 15px; margin: 0 0 10px; color: #94a3b8; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #334155; }
+th { color: #64748b; font-weight: 500; }
+tr.critical td { color: #f87171; }
+tr.warning td { color: #fbbf24; }
+pre { background: #0b1220; padding: 10px; border-radius: 8px; font-size: 12px; min-height: 40px; white-space: pre-wrap; }
+form label { margin-right: 12px; font-size: 13px; }
+input { background: #0b1220; border: 1px solid #334155; color: #e2e8f0; border-radius: 6px; padding: 4px 8px; width: 70px; }
+button { background: #0ea5e9; border: 0; color: #04121f; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
